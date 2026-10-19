@@ -1,0 +1,38 @@
+{
+  "name": "dsh-local-bridge",
+  "version": "0.1.0",
+  "description": "A local messaging bridge for DeepSeek Harness, Claude Code and Codex on Windows",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "files": [
+    "*.mjs",
+    "*.ps1",
+    "cordis.patch.yml",
+    "README.md",
+    "contracts.d.ts",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=22",
+    "dsh": "0.2.1-rc.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "license": "Apache-2.0",
+  "private": true,
+  "author": "z-fdg",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zhz-viads/dsh-local-bridge.git"
+  }
+}

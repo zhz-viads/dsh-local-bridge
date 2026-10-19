@@ -1,0 +1,8 @@
+node_modules/
+VALIDATION.md
+validation-evidence.json
+*.log
+.env
+.env.*
+*.key
+*.pem
