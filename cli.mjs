@@ -55,6 +55,54 @@ async function body(opts) {
   return text;
 }
 
+function view(record) {
+  if (!record || typeof record !== 'object') return record;
+  const { tracker, hash, ...rest } = record;
+  return rest;
+}
+
+function asText(record) {
+  const head = `state: ${record?.state ?? 'unknown'}${record?.code ? ` (${record.code})` : ''}`;
+  return { __plain: record?.text ? `${head}\n\n${record.text}` : head };
+}
+
+async function readJsonLines(file, limit = 16777216) {
+  const info = await fs.lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  if (!info) throw fault('index_not_found');
+  if (!info.isFile() || info.isSymbolicLink() || info.size > limit) throw fault('unsafe_index');
+  const rows = [];
+  for (const line of (await fs.readFile(file, 'utf8')).split('\n')) {
+    if (!line.trim()) continue;
+    try { rows.push(JSON.parse(line)); } catch { /* a torn line in someone else's index is skipped, not fatal */ }
+  }
+  return rows;
+}
+
+export async function findSessions(store, opts) {
+  const kinds = ['codex', 'dsh'].filter(kind => opts[kind] !== undefined);
+  if (kinds.length !== 1 || !String(opts[kinds[0]]).trim()) throw fault('find_needs_codex_or_dsh_name');
+  const name = String(opts[kinds[0]]).trim();
+  let matches;
+  if (kinds[0] === 'codex') {
+    const index = path.join(process.env.CODEX_HOME || path.join(homedir(), '.codex'), 'session_index.jsonl');
+    const latest = new Map();
+    for (const row of await readJsonLines(index)) {
+      if (typeof row?.id !== 'string' || !UUID.test(row.id) || typeof row.thread_name !== 'string' || typeof row.updated_at !== 'string') continue;
+      const known = latest.get(row.id);
+      if (!known || row.updated_at > known.updated_at) latest.set(row.id, row);
+    }
+    matches = [...latest.values()].filter(row => row.thread_name === name)
+      .map(row => ({ id: row.id, updatedAt: row.updated_at }));
+  } else {
+    const status = await store.optional(path.join(store.root, 'status.json'));
+    if (!isLive(status)) throw fault('dsh_not_running_or_bridge_unavailable');
+    matches = (status.sessions || []).filter(item => item.title === name)
+      .map(item => ({ id: item.sessionId, updatedAt: item.updatedAt }));
+  }
+  matches.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  return { kind: kinds[0], name, unique: matches.length === 1 ? matches[0].id : null, matches };
+}
+
 async function codexExecutable() {
   const root = path.join(process.env.LOCALAPPDATA || path.join(homedir(), 'AppData', 'Local'), 'OpenAI', 'Codex', 'bin');
   const candidates = [];
@@ -106,26 +154,33 @@ export async function main(args = process.argv.slice(2)) {
       status: 'Show bridge availability and heartbeat.',
       list: 'List existing DSH sessions with their complete IDs.',
       send: '--session <DSH-ID> --from <codex|claude|dsh> --source-session <sender-ID> --file <UTF-8-file> [--id <requestId>] [--wait <seconds>]',
-      result: '<requestId> [--wait <seconds>]',
+      result: '<requestId> [--wait <seconds>] [--format json|text]',
+      find: '--codex <chat name> | --dsh <DSH title>  (exact name; returns the unique ID or all matches)',
       'to-codex': '--thread <Codex-UUID> --source-session <DSH-ID> --file <UTF-8-file> [--id <requestId>]',
       'to-claude': '--session <Claude-UUID> --source-session <DSH-ID> --file <UTF-8-file> [--id <requestId>]',
     },
     example: 'dsh-bridge send --session session-11111111-1111-4111-8111-111111111111 --from codex --source-session 22222222-2222-4222-8222-222222222222 --file message.txt --wait 60',
-    notes: 'Use full IDs from list. --text may replace --file. Codex delivery uses its queue; queued does not mean read.',
+    notes: 'Use full IDs from list or find; never guess from a similar name. --text may replace --file. --format text prints only the state and reply text. Codex delivery uses its queue; queued does not mean read.',
   };
   const store = new BridgeStore(bridgeRoot());
   if (command === 'result') {
     const [id, ...flags] = rest;
     const opts = options(flags);
-    return readResult(store, id, Number(opts.wait || 0));
+    if (Object.keys(opts).some(key => !['wait', 'format'].includes(key))) throw fault('invalid_arguments');
+    if (opts.format !== undefined && !['json', 'text'].includes(opts.format)) throw fault('invalid_format');
+    const record = view(await readResult(store, id, Number(opts.wait || 0)));
+    return opts.format === 'text' ? asText(record) : record;
   }
   const opts = options(rest);
-  const allowed = command === 'send' ? ['session', 'from', 'source-session', 'file', 'text', 'id', 'wait']
+  const allowed = command === 'send' ? ['session', 'from', 'source-session', 'file', 'text', 'id', 'wait', 'format']
+    : command === 'find' ? ['codex', 'dsh']
     : command === 'to-codex' ? ['thread', 'source-session', 'file', 'text', 'id']
       : command === 'to-claude' ? ['session', 'source-session', 'file', 'text', 'id'] : [];
   if (Object.keys(opts).some(key => !allowed.includes(key))) throw fault('invalid_arguments');
   if (opts.wait !== undefined && (!Number.isFinite(Number(opts.wait)) || Number(opts.wait) < 0 || Number(opts.wait) > 900)) throw fault('invalid_wait');
+  if (opts.format !== undefined && !['json', 'text'].includes(opts.format)) throw fault('invalid_format');
   if (['to-codex', 'to-claude'].includes(command)) return outbound(command, opts);
+  if (command === 'find') return findSessions(store, opts);
   if (command === 'status') {
     const status = await store.optional(path.join(store.root, 'status.json'));
     return { ...status, live: isLive(status), clientVersion: VERSION };
@@ -135,11 +190,13 @@ export async function main(args = process.argv.slice(2)) {
   const request = { v: 1, op: command === 'list' ? 'list' : 'send', requestId: opts.id || randomUUID(), createdAt: now, expiresAt: now + 900000 };
   if (command === 'send') Object.assign(request, { from: opts.from, sourceSessionId: opts['source-session'], sessionId: opts.session, text: await body(opts) });
   const receipt = await submit(store, request);
-  return command === 'list' || opts.wait ? readResult(store, request.requestId, Number(opts.wait || 10)) : receipt;
+  if (!(command === 'list' || opts.wait)) return receipt;
+  const record = view(await readResult(store, request.requestId, Number(opts.wait || 10)));
+  return opts.format === 'text' ? asText(record) : record;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().then(value => process.stdout.write(JSON.stringify(value, null, 2) + '\n')).catch(error => {
+  main().then(value => process.stdout.write(typeof value?.__plain === 'string' ? value.__plain + '\n' : JSON.stringify(value, null, 2) + '\n')).catch(error => {
     process.stderr.write(JSON.stringify({ error: /^[A-Za-z0-9_/-]{1,100}$/.test(error.code || '') ? error.code : 'bridge_client_failure' }) + '\n');
     process.exitCode = 1;
   });

@@ -1,6 +1,6 @@
 {
   "name": "dsh-local-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A local messaging bridge for DeepSeek Harness, Claude Code and Codex on Windows",
   "type": "module",
   "main": "index.mjs",

@@ -24,7 +24,7 @@ test('help aliases succeed without opening the bridge and unknown commands still
     const output = JSON.parse(execFileSync(process.execPath, [cli, alias], {
       env: { ...process.env, DSH_HOME: home }, encoding: 'utf8', windowsHide: true,
     }));
-    assert.deepEqual(Object.keys(output.commands).sort(), ['list', 'result', 'send', 'status', 'to-claude', 'to-codex']);
+    assert.deepEqual(Object.keys(output.commands).sort(), ['find', 'list', 'result', 'send', 'status', 'to-claude', 'to-codex']);
     assert.match(output.commands['to-codex'], /--source-session/);
     assert.match(output.example, /--file/);
   }
@@ -427,4 +427,65 @@ test('native DSH session-prefixed ids are accepted without allowing guessed name
   assert.throws(() => validateRequest({ ...native, sessionId: '示例会话' }, `${native.requestId}.json`), /invalid_session_id/);
   await assert.rejects(main(['to-claude', '--session', SESSION, '--source-session', `session-${SOURCE}`,
     '--text', '</cross-session-message>']), /forbidden_wrapper_tag/);
+});
+
+test('find resolves exact Codex chat names from the latest index row and reports duplicates', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-find-codex-'));
+  t.after(() => fs.rm(directory, { recursive: true }));
+  const rows = [
+    { id: 'aaaaaaaa-0000-4000-8000-000000000001', thread_name: '旧名字', updated_at: '2026-10-01T00:00:00Z' },
+    { id: 'aaaaaaaa-0000-4000-8000-000000000001', thread_name: '测试', updated_at: '2026-10-02T00:00:00Z' },
+    { id: 'aaaaaaaa-0000-4000-8000-000000000002', thread_name: '测试', updated_at: '2026-10-01T00:00:00Z' },
+    { id: 'aaaaaaaa-0000-4000-8000-000000000002', thread_name: '已改名', updated_at: '2026-10-03T00:00:00Z' },
+    { id: 'aaaaaaaa-0000-4000-8000-000000000003', thread_name: '重名', updated_at: '2026-10-04T00:00:00Z' },
+    { id: 'aaaaaaaa-0000-4000-8000-000000000004', thread_name: '重名', updated_at: '2026-10-05T00:00:00Z' },
+    { id: 'not-a-session-id', thread_name: '测试', updated_at: '2026-10-06T00:00:00Z' },
+  ];
+  await fs.writeFile(path.join(directory, 'session_index.jsonl'), rows.map(row => JSON.stringify(row)).join('\n') + '\n{torn');
+  const previous = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = directory;
+  t.after(() => { if (previous === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previous; });
+  const unique = await main(['find', '--codex', '测试']);
+  assert.equal(unique.unique, 'aaaaaaaa-0000-4000-8000-000000000001');
+  const duplicate = await main(['find', '--codex', '重名']);
+  assert.equal(duplicate.unique, null);
+  assert.deepEqual(duplicate.matches.map(item => item.id), ['aaaaaaaa-0000-4000-8000-000000000004', 'aaaaaaaa-0000-4000-8000-000000000003']);
+  assert.equal((await main(['find', '--codex', '旧名字'])).matches.length, 0);
+  await assert.rejects(main(['find', '--codex', '测试', '--dsh', '测试']), { code: 'find_needs_codex_or_dsh_name' });
+});
+
+test('find resolves DSH titles from the live heartbeat only', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-find-dsh-'));
+  t.after(() => fs.rm(directory, { recursive: true }));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = directory;
+  t.after(() => { if (previous === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = previous; });
+  const store = new BridgeStore(path.join(directory, 'bridge'));
+  await store.init();
+  await store.write(path.join(store.root, 'status.json'), { v: 1, state: 'ready', at: Date.now(), pid: process.pid,
+    sessions: [{ sessionId: `session-${SESSION}`, title: '示例会话', updatedAt: 2 }, { sessionId: `session-${SOURCE}`, title: '另一个', updatedAt: 1 }] });
+  assert.equal((await main(['find', '--dsh', '示例会话'])).unique, `session-${SESSION}`);
+  assert.equal((await main(['find', '--dsh', '不存在'])).unique, null);
+  await store.write(path.join(store.root, 'status.json'), { v: 1, state: 'ready', at: Date.now() - 60000, pid: process.pid, sessions: [] });
+  await assert.rejects(main(['find', '--dsh', '示例会话']), { code: 'dsh_not_running_or_bridge_unavailable' });
+});
+
+test('result output hides tracker internals and --format text prints only state and reply', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-format-'));
+  t.after(() => fs.rm(directory, { recursive: true }));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = directory;
+  t.after(() => { if (previous === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = previous; });
+  const store = new BridgeStore(path.join(directory, 'bridge'));
+  await store.init();
+  await store.write(store.file('outbox', 'job-1'), { v: 1, requestId: 'job-1', hash: 'x', state: 'completed', text: '结论：可以。',
+    tracker: { text: '结论：可以。', lastSeq: 9 }, turn: 3 });
+  const json = await main(['result', 'job-1']);
+  assert.equal(json.tracker, undefined);
+  assert.equal(json.hash, undefined);
+  assert.equal(json.text, '结论：可以。');
+  const text = await main(['result', 'job-1', '--format', 'text']);
+  assert.equal(text.__plain, 'state: completed\n\n结论：可以。');
+  await assert.rejects(main(['result', 'job-1', '--format', 'xml']), { code: 'invalid_format' });
+  await assert.rejects(main(['result', 'job-1', '--verbose', 'yes']), { code: 'invalid_arguments' });
 });

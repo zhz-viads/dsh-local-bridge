@@ -26,13 +26,13 @@
 
 ## 安装
 
-先从 [v0.1.0 Release](https://github.com/zhz-viads/dsh-local-bridge/releases/tag/v0.1.0) 下载 `dsh-local-bridge-v0.1.0-source.zip`。下面的 PowerShell 示例把源码放到当前用户的 DSH 本地插件目录：
+先从 [v0.1.1 Release](https://github.com/zhz-viads/dsh-local-bridge/releases/tag/v0.1.1) 下载 `dsh-local-bridge-v0.1.1-source.zip`。下面的 PowerShell 示例把源码放到当前用户的 DSH 本地插件目录：
 
 ```powershell
 $pluginRoot = Join-Path $env:USERPROFILE '.dsh\local-plugins'
 New-Item -ItemType Directory -Path $pluginRoot -Force | Out-Null
-Expand-Archive -LiteralPath '.\dsh-local-bridge-v0.1.0-source.zip' -DestinationPath $pluginRoot
-$plugin = Join-Path $pluginRoot 'dsh-local-bridge-v0.1.0'
+Expand-Archive -LiteralPath '.\dsh-local-bridge-v0.1.1-source.zip' -DestinationPath $pluginRoot
+$plugin = Join-Path $pluginRoot 'dsh-local-bridge-v0.1.1'
 dsh plugin --profile desktop add --ignore-scripts "file:$plugin"
 ```
 
@@ -43,7 +43,7 @@ dsh plugin --profile desktop add --ignore-scripts "file:$plugin"
 客户端可以直接用 Node 运行，不需要额外的快捷脚本：
 
 ```powershell
-$cli = Join-Path $env:USERPROFILE '.dsh\local-plugins\dsh-local-bridge-v0.1.0\cli.mjs'
+$cli = Join-Path $env:USERPROFILE '.dsh\local-plugins\dsh-local-bridge-v0.1.1\cli.mjs'
 node $cli help
 node $cli status
 node $cli list
@@ -63,6 +63,7 @@ node $cli send --session $targetSession --from codex --source-session $senderSes
 
 ```powershell
 node $cli result 'example-request' --wait 60
+node $cli result 'example-request' --wait 60 --format text   # 只看状态和回复正文
 ```
 
 重试同一条请求时加上 `--id 原requestId`，并保持目标、来源和正文一致。重复使用编号却更换内容，会被拒绝。
@@ -75,6 +76,21 @@ $peerSession = '22222222-2222-4222-8222-222222222222'
 node $cli to-codex --thread $peerSession --source-session $dshSession --file '.\message.txt'
 node $cli to-claude --session $peerSession --source-session $dshSession --file '.\message.txt'
 ```
+
+## 按聊天名找会话
+
+只知道聊天名时，先查出唯一的会话编号再发，不按相似名字猜：
+
+```powershell
+node $cli find --codex '测试'   # 查 Codex 聊天（读取本机 Codex 的会话索引，取每个聊天最新的名字）
+node $cli find --dsh '测试'     # 查 DSH 会话（读取插件心跳里的会话列表）
+```
+
+`unique` 有值才可以直接用；为空时 `matches` 会列出所有同名会话，或者为空表示没找到，这时请让用户指定。Codex 的会话索引是它的内部文件，客户端升级后格式可能变化。
+
+## 回复会写得短一些
+
+插件注入给 DSH 的说明里约定：通过桥接收到的协作消息，第一句给结论，最多 5 条要点；不复述对方原文；超过约 800 字时把全文写进对方指定的文件，回复里只给路径和摘要。这只是写作约定，具体长度由模型把握。
 
 ## 收到回执，代表到了哪一步
 
@@ -110,9 +126,9 @@ DSH 方向会跟踪对应轮次的回复。从 DSH 发到 Claude Code、Codex �
 
 ## 验证摘要
 
-公开副本重新执行 `node --test test/bridge.test.mjs`，23 项单元测试通过，覆盖去重、排队、请求校验、重载恢复、超时和异常文件处理。
+公开副本重新执行 `node --test test/bridge.test.mjs`，26 项单元测试通过，覆盖去重、排队、请求校验、重载恢复、超时和异常文件处理。
 
-发布前的本地安装版本还完成了 6 条真实往返核对：每条在 DSH 原生日志中恰好出现一次用户消息和一次 inbox 插入；accepted 后停用、启用插件能够恢复；DSH 发往 Claude Code、Codex 的消息都由接收方确认收到。这些是既定 Windows 环境下的验收结果。公开副本做过去个人信息处理，尚未替换本机安装版本。
+v0.1.0 发布前的本机安装版还完成了 6 条真实往返核对：每条在 DSH 原生日志中恰好出现一次用户消息和一次 inbox 插入；accepted 后停用、启用插件能够恢复；DSH 发往 Claude Code、Codex 的消息都由接收方确认收到。这些是既定 Windows 环境下的历史验收结果。v0.1.1 的本机安装与公开源码使用同一份代码，本次更新不重复触发真实模型请求。
 
 ## 卸载
 
@@ -121,6 +137,11 @@ dsh plugin --profile desktop remove dsh-local-bridge
 ```
 
 卸载后重载桌面版。本地通信记录会保留；需要删除时，先确认其中没有还要用的任务和回复。
+
+## 更新记录
+
+- **0.1.1**：新增 `find`，按聊天名查唯一会话编号，跳过索引中格式错误的编号；`result` 和 `send --wait` 支持 `--format text`，只输出状态和回复正文；默认输出不再带内部跟踪字段；注入说明要求 DSH 通过桥接回复时简短、先给结论；本机安装与公开源码统一。
+- **0.1.0**：首个公开版本。
 
 ## 许可证
 
