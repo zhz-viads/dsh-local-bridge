@@ -14,7 +14,8 @@ $sessionMatches = @(Get-ChildItem -LiteralPath $registryDirectory -Filter '*.jso
 if ($sessionMatches.Count -ne 1) { throw 'claude_session_not_unique' }
 $target = $sessionMatches[0].Metadata
 $targetProcess = Get-Process -Id $target.pid
-if ($targetProcess.ProcessName -ne 'claude' -or $target.peerProtocol -ne 1 -or $target.kind -ne 'interactive') { throw 'unsupported_claude_session' }
+if ($targetProcess.ProcessName -ne 'claude' -or $target.peerProtocol -ne 1) { throw 'unsupported_claude_session' }
+if ($target.kind -ne 'interactive') { throw 'claude_session_requires_interactive' }
 if ($targetProcess.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -ne [string]$target.procStart) { throw 'claude_process_changed' }
 $keys = @(Get-ChildItem -LiteralPath $registryDirectory -Filter ($target.pid.ToString() + '.*.key') -File)
 if ($keys.Count -ne 1) { throw 'claude_peer_key_not_unique' }

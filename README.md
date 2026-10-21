@@ -26,13 +26,13 @@
 
 ## 安装
 
-先从 [v0.1.1 Release](https://github.com/zhz-viads/dsh-local-bridge/releases/tag/v0.1.1) 下载 `dsh-local-bridge-v0.1.1-source.zip`。下面的 PowerShell 示例把源码放到当前用户的 DSH 本地插件目录：
+先从 [v0.2.0 Release](https://github.com/zhz-viads/dsh-local-bridge/releases/tag/v0.2.0) 下载 `dsh-local-bridge-v0.2.0-source.zip`。下面的 PowerShell 示例把源码放到当前用户的 DSH 本地插件目录：
 
 ```powershell
 $pluginRoot = Join-Path $env:USERPROFILE '.dsh\local-plugins'
 New-Item -ItemType Directory -Path $pluginRoot -Force | Out-Null
-Expand-Archive -LiteralPath '.\dsh-local-bridge-v0.1.1-source.zip' -DestinationPath $pluginRoot
-$plugin = Join-Path $pluginRoot 'dsh-local-bridge-v0.1.1'
+Expand-Archive -LiteralPath '.\dsh-local-bridge-v0.2.0-source.zip' -DestinationPath $pluginRoot
+$plugin = Join-Path $pluginRoot 'dsh-local-bridge-v0.2.0'
 dsh plugin --profile desktop add --ignore-scripts "file:$plugin"
 ```
 
@@ -43,7 +43,7 @@ dsh plugin --profile desktop add --ignore-scripts "file:$plugin"
 客户端可以直接用 Node 运行，不需要额外的快捷脚本：
 
 ```powershell
-$cli = Join-Path $env:USERPROFILE '.dsh\local-plugins\dsh-local-bridge-v0.1.1\cli.mjs'
+$cli = Join-Path $env:USERPROFILE '.dsh\local-plugins\dsh-local-bridge-v0.2.0\cli.mjs'
 node $cli help
 node $cli status
 node $cli list
@@ -88,9 +88,11 @@ node $cli find --dsh '测试'     # 查 DSH 会话（读取插件心跳里的会
 
 `unique` 有值才可以直接用；为空时 `matches` 会列出所有同名会话，或者为空表示没找到，这时请让用户指定。Codex 的会话索引是它的内部文件，客户端升级后格式可能变化。
 
-## 回复会写得短一些
+## 协作回复
 
-插件注入给 DSH 的说明里约定：通过桥接收到的协作消息，第一句给结论，最多 5 条要点；不复述对方原文；超过约 800 字时把全文写进对方指定的文件，回复里只给路径和摘要。这只是写作约定，具体长度由模型把握。
+通过桥接收到消息后，DSH直接在当前轮给出完整回复，发送方用result读取；除非明确要求，不再另发一遍。回复先给结论，任务卡里的条目逐项写全。篇幅是否转成文件由任务卡或发送方指定，没有固定的字数或要点数量限制。
+
+主动发送正文最多32 KiB，超出时先把全文写入双方约定的文件，再发送路径和摘要。读取回复时，outbox单个JSON文件的上限是1 MiB，包含封装字段。
 
 ## 收到回执，代表到了哪一步
 
@@ -107,7 +109,7 @@ DSH 方向会跟踪对应轮次的回复。从 DSH 发到 Claude Code、Codex �
 
 ## 已知限制
 
-- Codex 正忙时，消息进入它的待发送队列，通常等当前轮结束后处理。需要立即追加时，可由用户在界面上点击“引导”；插件不替你点击。
+- Codex 正忙时，消息进入它的待发送队列，可能在当前轮收到，也可能稍后处理；入队不保证处理时间。需要立即追加时，可由用户在界面上点击“引导”；插件不替你点击。
 - 插件重载后，已接收或正在运行的请求恢复跟踪，不重新发出。恢复依赖最近 500 条消息的历史窗口，超长轮次尚未充分验证。
 - 在界面里删除排队消息后，桥接跟踪最多等待 15 分钟再报告 `reply_timeout`，不会自动重发。
 - DSH 中的权限确认需要用户处理；桥接等待不代表它能识别每一种权限弹窗。
@@ -126,9 +128,13 @@ DSH 方向会跟踪对应轮次的回复。从 DSH 发到 Claude Code、Codex �
 
 ## 验证摘要
 
-公开副本重新执行 `node --test test/bridge.test.mjs`，26 项单元测试通过，覆盖去重、排队、请求校验、重载恢复、超时和异常文件处理。
+公开副本执行 `npm test`（三个测试文件），76项测试通过，覆盖去重、排队、请求校验、重载恢复、启动与运行超时、健康检查、异常文件处理、会话索引损坏和交互会话限制。测试使用隔离目录及模拟接口，不向真实模型发送请求。
 
-v0.1.0 发布前的本机安装版还完成了 6 条真实往返核对：每条在 DSH 原生日志中恰好出现一次用户消息和一次 inbox 插入；accepted 后停用、启用插件能够恢复；DSH 发往 Claude Code、Codex 的消息都由接收方确认收到。这些是既定 Windows 环境下的历史验收结果。v0.1.1 的本机安装与公开源码使用同一份代码，本次更新不重复触发真实模型请求。
+v0.1.0 发布前的本机安装版还完成了 6 条真实往返核对：每条在 DSH 原生日志中恰好出现一次用户消息和一次 inbox 插入；accepted 后停用、启用插件能够恢复；DSH 发往 Claude Code、Codex 的消息都由接收方确认收到。这些是既定 Windows 环境下的历史验收结果。这些真实往返不是0.2.0公开副本的再次实测；本次发布没有重复触发真实模型请求。
+
+## 公开副本与本机安装版的差异
+
+公开副本升为0.2.0，安装版的版本号不在本次发布中修改。公开副本将注入说明和收发消息附带的个人规则引用改成通用文字，并相应调整两份文本断言；传输、重试、锁、会话校验及权限校验逻辑保留。不会附带本机验收记录、会话数据或配置。
 
 ## 卸载
 
@@ -139,6 +145,11 @@ dsh plugin --profile desktop remove dsh-local-bridge
 卸载后重载桌面版。本地通信记录会保留；需要删除时，先确认其中没有还要用的任务和回复。
 
 ## 更新记录
+
+- **0.2.0**：启动遇到临时错误会重试；启动等待超过20秒会退出本次尝试，避免一直挂着。运行中失去锁或连接中断后，健康检查会尝试恢复，并保护其他实例的心跳和锁。
+- 会话列表刷新失败后逐步延长重试间隔，恢复成功后清除旧错误；恢复期间只要心跳仍然新鲜，消息可以继续排队、等待对应回复。
+- 按聊天名查找时，索引损坏或不完整会明确报错，避免把不完整结果误认成唯一会话；向Claude Code投递时明确要求交互会话。
+- 协作回复先给结论、按任务卡逐项写全；同一已授权步骤只交一份完整回复。公开版使用通用协作说明，不依赖维护者本机的规则文件。
 
 - **0.1.1**：新增 `find`，按聊天名查唯一会话编号，跳过索引中格式错误的编号；`result` 和 `send --wait` 支持 `--format text`，只输出状态和回复正文；默认输出不再带内部跟踪字段；注入说明要求 DSH 通过桥接回复时简短、先给结论；本机安装与公开源码统一。
 - **0.1.0**：首个公开版本。

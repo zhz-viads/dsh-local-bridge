@@ -3,7 +3,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 
-export const VERSION = '0.1.1';
+export const VERSION = '0.2.0';
 export const ID = /^[A-Za-z0-9_-]{1,64}$/;
 export const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 export const SESSION_ID = /^(?:session-)?[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
@@ -100,7 +100,8 @@ export class BridgeStore {
     try {
       const after = await handle.stat();
       if (after.ino !== before.ino || after.dev !== before.dev || after.size > limit) throw fault('file_changed');
-      return JSON.parse(await handle.readFile('utf8'));
+      try { return JSON.parse(await handle.readFile('utf8')); }
+      catch (error) { if (error instanceof SyntaxError) throw fault('invalid_json'); throw error; }
     } finally { await handle.close(); }
   }
 
@@ -199,4 +200,9 @@ export class BridgeStore {
 
 export function isLive(status, now = Date.now()) {
   return status?.state === 'ready' && Number.isFinite(status.at) && now - status.at >= -5000 && now - status.at < 30000;
+}
+
+export function isAvailable(status, now = Date.now()) {
+  return isLive(status, now) || (status?.state === 'retrying' && Number.isFinite(status.at)
+    && now - status.at >= -5000 && now - status.at < 60000);
 }

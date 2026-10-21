@@ -127,6 +127,25 @@ async function setup(t, options = {}) {
   return { root, gateway, bridge, store: bridge.store, instances };
 }
 
+test('rules consolidation inbound envelope preserves request identity and per-step exceptions', async t => {
+  const { store, gateway } = await setup(t);
+  const job = request({ text: 'Check the repaired step.' });
+  await submit(store, job);
+  await until(() => gateway.prompts.length === 1);
+  const [header, body] = gateway.prompts[0].content[0].text.split('\n\n');
+  assert.equal(body, job.text);
+  for (const identity of [job.requestId, job.sourceSessionId, job.sessionId, job.from]) assert.ok(header.includes(identity));
+  assert.match(header, /不能当作用户本人授权/);
+  assert.match(header, /同一已授权步骤只回一次/);
+  assert.match(header, /返修复核/);
+  assert.match(header, /头脑风暴与反驳再辩按用户已授权的流程继续/);
+  assert.match(header, /不自动循环/);
+  assert.doesNotMatch(header, /[A-Za-z]:[\\/]+Users[\\/]/);
+  assert.doesNotMatch(header, /每个任务只回一次/);
+  gateway.complete(job.requestId);
+  await until(async () => (await readResult(store, job.requestId)).state === 'completed');
+});
+
 test('acceptance is distinct from completion; only the matching turn supplies a reply', async t => {
   const { store, gateway } = await setup(t);
   const job = request();
@@ -439,9 +458,8 @@ test('find resolves exact Codex chat names from the latest index row and reports
     { id: 'aaaaaaaa-0000-4000-8000-000000000002', thread_name: '已改名', updated_at: '2026-10-03T00:00:00Z' },
     { id: 'aaaaaaaa-0000-4000-8000-000000000003', thread_name: '重名', updated_at: '2026-10-04T00:00:00Z' },
     { id: 'aaaaaaaa-0000-4000-8000-000000000004', thread_name: '重名', updated_at: '2026-10-05T00:00:00Z' },
-    { id: 'not-a-session-id', thread_name: '测试', updated_at: '2026-10-06T00:00:00Z' },
   ];
-  await fs.writeFile(path.join(directory, 'session_index.jsonl'), rows.map(row => JSON.stringify(row)).join('\n') + '\n{torn');
+  await fs.writeFile(path.join(directory, 'session_index.jsonl'), rows.map(row => JSON.stringify(row)).join('\n') + '\n');
   const previous = process.env.CODEX_HOME;
   process.env.CODEX_HOME = directory;
   t.after(() => { if (previous === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previous; });
@@ -488,4 +506,619 @@ test('result output hides tracker internals and --format text prints only state 
   assert.equal(text.__plain, 'state: completed\n\n结论：可以。');
   await assert.rejects(main(['result', 'job-1', '--format', 'xml']), { code: 'invalid_format' });
   await assert.rejects(main(['result', 'job-1', '--verbose', 'yes']), { code: 'invalid_arguments' });
+});
+
+test('supervisor retries a failed startup and stops cleanly on dispose', async () => {
+  const { superviseBridge } = await import('../index.mjs');
+  const created = [];
+  const statuses = [];
+  const timers = [];
+  let failures = 2;
+  const create = () => {
+    const bridge = {
+      stopped: 0,
+      async start() { if (failures-- > 0) throw Object.assign(new Error('not ready'), { code: 'session_not_ready' }); },
+      async stop() { bridge.stopped += 1; },
+      async status(state, code) { statuses.push([state, code]); },
+    };
+    created.push(bridge);
+    return bridge;
+  };
+  const supervisor = superviseBridge(create, { baseDelayMs: 1000, schedule: (fn, ms) => { timers.push(ms); fn(); return timers.length; }, cancel: () => {} });
+  for (let i = 0; i < 20 && !supervisor.bridge; i += 1) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(created.length, 3);
+  assert.deepEqual(timers, [1000, 2000]);
+  assert.deepEqual(statuses, [['retrying', 'session_not_ready'], ['retrying', 'session_not_ready']]);
+  assert.equal(supervisor.bridge, created[2]);
+  await supervisor.dispose();
+  assert.equal(created[2].stopped, 1);
+});
+
+test('supervisor does not overwrite another owner heartbeat and cancels retries on dispose', async () => {
+  const { superviseBridge } = await import('../index.mjs');
+  const statuses = [];
+  const cancelled = [];
+  const supervisor = superviseBridge(() => ({
+    async start() { throw Object.assign(new Error('busy'), { code: 'bridge_already_running' }); },
+    async stop() {},
+    async status(state) { statuses.push(state); },
+  }), { schedule: () => 'timer-1', cancel: id => cancelled.push(id) });
+  for (let i = 0; i < 5; i += 1) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(supervisor.attempts, 1);
+  assert.deepEqual(statuses, []);
+  await supervisor.dispose();
+  assert.deepEqual(cancelled, ['timer-1']);
+  assert.equal(supervisor.bridge, null);
+});
+
+
+test('startup times out an unresponsive list and cannot revive after a late response', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-start-timeout-'));
+  let release;
+  const gateway = { invoke: () => new Promise(resolve => { release = resolve; }) };
+  const bridge = new LocalBridge(gateway, {}, { root, startTimeoutMs: 40, stopTimeoutMs: 30 });
+  t.after(async () => { await bridge.stop(); await fs.rm(root, { recursive: true }); });
+  await assert.rejects(bridge.start(), { code: 'bridge_start_timeout' });
+  assert.equal(bridge.ownsLock, false);
+  assert.equal(await bridge.store.optional(path.join(root, 'owner.json')), null);
+  assert.equal(bridge.timer, undefined);
+  release({ items: [] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal((await bridge.store.read(path.join(root, 'status.json'))).state, 'stopped');
+  assert.equal(bridge.timer, undefined);
+});
+
+test('stop interrupts pending startup and never installs its polling interval', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-stop-start-'));
+  let entered = false;
+  const bridge = new LocalBridge({ invoke() { entered = true; return new Promise(() => {}); } }, {},
+    { root, startTimeoutMs: 10000, stopTimeoutMs: 30 });
+  t.after(async () => { await bridge.stop(); await fs.rm(root, { recursive: true }); });
+  const starting = assert.rejects(bridge.start(), { code: 'bridge_stopped' });
+  await until(() => entered);
+  await bridge.stop();
+  await starting;
+  assert.equal(bridge.timer, undefined);
+  assert.equal(await bridge.store.optional(path.join(root, 'owner.json')), null);
+});
+
+test('refresh failure backs off 5 to 30 seconds while retention still runs and resets on recovery', async t => {
+  const { bridge, gateway, store, root } = await setup(t);
+  clearInterval(bridge.timer);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const invoke = gateway.invoke.bind(gateway);
+  let lists = 0;
+  let fail = true;
+  gateway.invoke = async call => {
+    if (call.method === 'list') {
+      lists++;
+      if (fail) throw Object.assign(new Error('unavailable'), { code: 'session_unavailable' });
+    }
+    return invoke(call);
+  };
+  let prunes = 0;
+  bridge.store.prune = async () => { prunes++; };
+  bridge.prunedAt = 0;
+  bridge.nextRefreshAt = now;
+  for (const expectedDelay of [5000, 10000, 20000, 30000, 30000]) {
+    const before = lists;
+    await bridge.tick();
+    assert.equal(lists, before + 1);
+    assert.equal(bridge.refreshedAt, now);
+    assert.equal(bridge.nextRefreshAt, now + expectedDelay);
+    for (let i = 0; i < 5; i++) await bridge.tick();
+    assert.equal(lists, before + 1, 'poll ticks must not repeat a failed list');
+    assert.ok(prunes > 0, 'a failed refresh must not skip retention');
+    now = bridge.nextRefreshAt;
+  }
+  fail = false;
+  await bridge.tick();
+  assert.equal(bridge.refreshFailures, 0);
+  assert.equal(bridge.nextRefreshAt, now + 5000);
+  assert.equal((await store.read(path.join(root, 'status.json'))).state, 'ready');
+  t.mock.restoreAll();
+});
+
+test('runtime refresh timeout releases the tick and still performs retention', async t => {
+  const { bridge, gateway } = await setup(t, { refreshTimeoutMs: 30 });
+  clearInterval(bridge.timer);
+  gateway.invoke = () => new Promise(() => {});
+  bridge.nextRefreshAt = 0;
+  bridge.prunedAt = 0;
+  let pruned = false;
+  bridge.store.prune = async () => { pruned = true; };
+  await bridge.tick();
+  assert.equal(bridge.lastError, 'session_list_timeout');
+  assert.equal(bridge.busy, false);
+  assert.equal(pruned, true);
+  assert.ok(bridge.nextRefreshAt > Date.now());
+});
+
+test('send --wait accepts retrying and returns at the deadline without losing the inbox request', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-cli-retry-'));
+  t.after(() => fs.rm(directory, { recursive: true }));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = directory;
+  t.after(() => { if (previous === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = previous; });
+  const store = new BridgeStore(path.join(directory, 'bridge'));
+  await store.init();
+  await store.write(path.join(store.root, 'status.json'), { state: 'retrying', at: Date.now() });
+  const result = await main(['send', '--session', SESSION, '--source-session', SOURCE,
+    '--from', 'codex', '--text', 'Retrying delivery', '--wait', '0.02']);
+  assert.equal(result.state, 'queued');
+  assert.equal((await store.read(store.file('inbox', result.requestId))).text, 'Retrying delivery');
+  await store.write(path.join(store.root, 'status.json'), { state: 'stopped', at: Date.now() });
+  await assert.rejects(readResult(store, result.requestId, 1), { code: 'dsh_not_running_or_bridge_unavailable' });
+  await assert.rejects(submit(store, request()), { code: 'dsh_not_running_or_bridge_unavailable' });
+  await store.write(path.join(store.root, 'status.json'), { state: 'retrying', at: Date.now() - 60001 });
+  await assert.rejects(readResult(store, result.requestId, 1), { code: 'dsh_not_running_or_bridge_unavailable' });
+  await assert.rejects(submit(store, request()), { code: 'dsh_not_running_or_bridge_unavailable' });
+});
+
+test('result keeps polling across retrying and a briefly missing heartbeat until the matching reply arrives', async () => {
+  for (const state of [null, { state: 'retrying', at: Date.now() }]) {
+    let reads = 0;
+    const fakeStore = {
+      root: '/fake',
+      file: () => '/fake/reply',
+      async optional(file) {
+        if (file === '/fake/reply') return ++reads === 1 ? { state: 'running' } : { state: 'completed', text: 'RECOVERED' };
+        return state;
+      },
+    };
+    assert.equal((await readResult(fakeStore, 'retry-job', 1)).text, 'RECOVERED');
+    assert.equal(reads, 2);
+  }
+});
+
+test('result stops waiting after a persistently missing heartbeat', async t => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const fakeStore = {
+    root: '/fake', file: () => '/fake/reply',
+    async optional(file) { if (file !== '/fake/reply') now += 6000; return null; },
+  };
+  await assert.rejects(readResult(fakeStore, 'missing-job', 30), { code: 'dsh_not_running_or_bridge_unavailable' });
+  t.mock.restoreAll();
+});
+
+test('stop is bounded for stuck work and ticks and releases its owner for the next instance', async t => {
+  const { bridge, gateway, store, root, instances } = await setup(t, { stopTimeoutMs: 30 });
+  clearInterval(bridge.timer);
+  bridge.active.set('stuck', new Promise(() => {}));
+  bridge.tickTask = new Promise(() => {});
+  bridge.busy = true;
+  const started = Date.now();
+  await bridge.stop();
+  assert.ok(Date.now() - started < 1000);
+  assert.equal(await store.optional(path.join(root, 'owner.json')), null);
+  const replacement = new LocalBridge(gateway, {}, { root, pollMs: 15 });
+  instances.push(replacement);
+  await replacement.start();
+  await bridge.status('retrying', 'late_old_error');
+  assert.equal((await store.read(path.join(root, 'status.json'))).state, 'ready');
+  assert.equal((await store.read(path.join(root, 'owner.json'))).token, replacement.token);
+});
+
+test('stop aborts a noncooperative follow and bounds an unresponsive iterator cleanup', async t => {
+  const { bridge, gateway, store } = await setup(t, { stopTimeoutMs: 30 });
+  gateway.stream = async () => ({ [Symbol.asyncIterator]() { return this; },
+    next: () => new Promise(() => {}), return: () => new Promise(() => {}) });
+  const job = request();
+  await submit(store, job);
+  await until(() => bridge.active.has(job.requestId));
+  const started = Date.now();
+  await bridge.stop();
+  assert.ok(Date.now() - started < 1000);
+  await until(() => bridge.active.size === 0);
+  assert.equal(gateway.prompts.length, 0);
+});
+
+test('stopping an old instance cannot overwrite or unlink a different owner token', async t => {
+  const { bridge, store, root } = await setup(t);
+  clearInterval(bridge.timer);
+  const owner = { pid: process.pid, token: 'replacement-owner' };
+  const status = { pid: process.pid, state: 'ready', at: Date.now(), marker: 'replacement-status' };
+  await store.write(path.join(root, 'owner.json'), owner);
+  await store.write(path.join(root, 'status.json'), status);
+  await bridge.stop();
+  assert.deepEqual(await store.read(path.join(root, 'owner.json')), owner);
+  assert.deepEqual(await store.read(path.join(root, 'status.json')), status);
+});
+
+test('invalid JSON has a stable code and a damaged abandoned owner is preserved and recovered', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-broken-owner-'));
+  const bridge = new LocalBridge(new FakeGateway(), {}, { root, pollMs: 15 });
+  t.after(async () => { await bridge.stop(); await fs.rm(root, { recursive: true }); });
+  await bridge.store.init();
+  await fs.writeFile(path.join(root, 'owner.json'), '{broken');
+  await assert.rejects(bridge.store.optional(path.join(root, 'owner.json')), { code: 'invalid_json' });
+  await bridge.start();
+  assert.equal((await bridge.store.read(path.join(root, 'owner.json'))).token, bridge.token);
+  const quarantined = (await fs.readdir(root)).filter(name => name.startsWith('owner.corrupt-'));
+  assert.equal(quarantined.length, 1);
+  assert.equal(await fs.readFile(path.join(root, quarantined[0]), 'utf8'), '{broken');
+});
+
+test('a damaged owner is not reclaimed while a different live process has a fresh heartbeat', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-broken-live-owner-'));
+  const bridge = new LocalBridge(new FakeGateway(), {}, { root });
+  t.after(async () => { await bridge.stop(); await fs.rm(root, { recursive: true }); });
+  await bridge.store.init();
+  await fs.writeFile(path.join(root, 'owner.json'), '{broken');
+  const status = { pid: process.ppid, state: 'ready', at: Date.now() };
+  await bridge.store.write(path.join(root, 'status.json'), status);
+  await assert.rejects(bridge.start(), { code: 'bridge_already_running' });
+  assert.equal(await fs.readFile(path.join(root, 'owner.json'), 'utf8'), '{broken');
+  assert.deepEqual(await bridge.store.read(path.join(root, 'status.json')), status);
+});
+
+test('supervisor retries a constructor failure instead of rejecting outside its guard', async () => {
+  const { superviseBridge } = await import('../index.mjs');
+  let creates = 0;
+  const timers = [];
+  const recovered = { async start() {}, async stop() {} };
+  const supervisor = superviseBridge(() => {
+    if (++creates === 1) throw Object.assign(new Error('constructor failed'), { code: 'create_failed' });
+    return recovered;
+  }, { schedule: (fn, ms) => { timers.push({ fn, ms }); return 1; }, cancel: () => {} });
+  await until(() => timers.length === 1);
+  assert.equal(timers[0].ms, 2000);
+  timers[0].fn();
+  await until(() => supervisor.bridge === recovered);
+  await supervisor.dispose();
+  assert.equal(creates, 2);
+});
+
+test('supervisor dispose stops its in-progress startup without waiting for the startup timeout', async t => {
+  const { superviseBridge } = await import('../index.mjs');
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-supervisor-stop-'));
+  let entered = false;
+  const bridge = new LocalBridge({ invoke() { entered = true; return new Promise(() => {}); } }, {},
+    { root, startTimeoutMs: 10000, stopTimeoutMs: 30 });
+  const supervisor = superviseBridge(() => bridge);
+  t.after(async () => { await supervisor.dispose(); await fs.rm(root, { recursive: true }); });
+  await until(() => entered);
+  const started = Date.now();
+  await supervisor.dispose();
+  assert.ok(Date.now() - started < 1000);
+  assert.equal(supervisor.bridge, null);
+  assert.equal(bridge.timer, undefined);
+  assert.equal(await bridge.store.optional(path.join(root, 'owner.json')), null);
+});
+
+
+test('heartbeat stays fresh during refresh backoff without writing on every poll', async t => {
+  const { bridge, gateway, store, root } = await setup(t);
+  clearInterval(bridge.timer);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  let lists = 0;
+  gateway.invoke = async () => { lists++; throw Object.assign(new Error('offline'), { code: 'session_unavailable' }); };
+  bridge.refreshFailures = 3;
+  bridge.nextRefreshAt = now;
+  const write = store.write.bind(store);
+  let statuses = 0;
+  store.write = async (file, value) => { if (path.basename(file) === 'status.json') statuses++; return write(file, value); };
+  await bridge.tick();
+  assert.equal(bridge.nextRefreshAt, now + 30000);
+  assert.equal(lists, 1);
+  assert.equal(statuses, 1);
+  for (let step = 1; step < 6; step++) {
+    now += 5000;
+    await bridge.tick();
+    assert.equal(lists, 1);
+    assert.equal(statuses, step + 1);
+    assert.equal(isLive(await store.read(path.join(root, 'status.json')), now), true);
+    for (let i = 0; i < 5; i++) await bridge.tick();
+    assert.equal(statuses, step + 1);
+  }
+  t.mock.restoreAll();
+});
+
+test('a second instance cannot steal a local owner while its initial list is still pending', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-pending-owner-'));
+  let entered = false;
+  const gateway = { invoke() { entered = true; return new Promise(() => {}); } };
+  const first = new LocalBridge(gateway, {}, { root, startTimeoutMs: 10000, stopTimeoutMs: 30 });
+  const second = new LocalBridge(new FakeGateway(), {}, { root });
+  t.after(async () => { await first.stop(); await second.stop(); await fs.rm(root, { recursive: true }); });
+  const pending = assert.rejects(first.start(), { code: 'bridge_stopped' });
+  await until(() => entered);
+  await assert.rejects(second.start(), { code: 'bridge_already_running' });
+  assert.equal((await first.store.read(path.join(root, 'owner.json'))).token, first.token);
+  await first.stop();
+  await pending;
+});
+
+
+test('valid JSON with an invalid owner shape is recovered instead of retrying EEXIST forever', async t => {
+  for (const contents of ['null', 'false', '0', '""', '{}']) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-invalid-owner-shape-'));
+    const bridge = new LocalBridge(new FakeGateway(), {}, { root, pollMs: 15 });
+    t.after(async () => { await bridge.stop(); await fs.rm(root, { recursive: true }); });
+    await bridge.store.init();
+    await fs.writeFile(path.join(root, 'owner.json'), contents);
+    await bridge.start();
+    assert.equal((await bridge.store.read(path.join(root, 'owner.json'))).token, bridge.token);
+    const quarantined = (await fs.readdir(root)).filter(name => name.startsWith('owner.corrupt-'));
+    assert.equal(quarantined.length, 1);
+    assert.equal(await fs.readFile(path.join(root, quarantined[0]), 'utf8'), contents);
+    await bridge.stop();
+  }
+});
+
+for (const change of ['replacement', 'missing', 'corrupt', 'null']) {
+  test(`lost-lock heartbeat stops before consuming inbox after owner becomes ${change}`, async t => {
+    const { bridge, store, root, gateway } = await setup(t, { stopTimeoutMs: 30 });
+    clearInterval(bridge.timer);
+    const ownerFile = path.join(root, 'owner.json');
+    const statusFile = path.join(root, 'status.json');
+    const statusBefore = await fs.readFile(statusFile, 'utf8');
+    if (change === 'missing') await fs.unlink(ownerFile);
+    else await fs.writeFile(ownerFile, change === 'replacement'
+      ? JSON.stringify({ pid: process.pid, token: 'replacement-owner' })
+      : change === 'corrupt' ? '{broken' : 'null');
+    const ownerBefore = await fs.readFile(ownerFile, 'utf8').catch(error => {
+      if (error.code !== 'ENOENT') throw error;
+      return null;
+    });
+    const job = request();
+    await store.write(store.file('inbox', job.requestId), job);
+    bridge.heartbeatAt = Date.now() - 5001;
+    await bridge.tick();
+    assert.equal(gateway.prompts.length, 0);
+    assert.deepEqual(await store.optional(store.file('inbox', job.requestId)), job);
+    assert.equal(await store.optional(store.file('outbox', job.requestId)), null);
+    assert.equal(bridge.lostLock, true);
+    assert.equal(bridge.lifetime.signal.aborted, true);
+    await until(() => !bridge.ownsLock);
+    assert.equal(bridge.ownsLock, false);
+    assert.equal(await fs.readFile(statusFile, 'utf8'), statusBefore);
+    assert.equal(await fs.readFile(ownerFile, 'utf8').catch(error => {
+      if (error.code !== 'ENOENT') throw error;
+      return null;
+    }), ownerBefore);
+  });
+}
+
+test('lost-lock status treats invalid_json as ownership loss without throwing or rewriting the heartbeat', async t => {
+  const { bridge, store, root } = await setup(t, { stopTimeoutMs: 30 });
+  clearInterval(bridge.timer);
+  const statusBefore = await store.read(path.join(root, 'status.json'));
+  await fs.writeFile(path.join(root, 'owner.json'), '{broken');
+  await assert.doesNotReject(bridge.status('ready'));
+  assert.equal(bridge.lostLock, true);
+  await until(() => !bridge.ownsLock);
+  await bridge.status('retrying', 'late-error');
+  assert.deepEqual(await store.read(path.join(root, 'status.json')), statusBefore);
+});
+
+test('early dispose reclaims an owner written after the first stop already completed', async t => {
+  const { superviseBridge } = await import('../index.mjs');
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-early-dispose-owner-'));
+  const bridge = new LocalBridge(new FakeGateway(), {}, { root, stopTimeoutMs: 30 });
+  const ownerFile = path.join(root, 'owner.json');
+  const writeFile = fs.writeFile.bind(fs);
+  let supervisor;
+  let disposed;
+  let intercepted = false;
+  t.mock.method(fs, 'writeFile', (file, ...args) => {
+    if (file === ownerFile && !intercepted) {
+      intercepted = true;
+      const stopped = bridge.stop();
+      disposed = supervisor.dispose();
+      return stopped.then(() => writeFile(file, ...args));
+    }
+    return writeFile(file, ...args);
+  });
+  supervisor = superviseBridge(() => bridge);
+  t.after(async () => {
+    t.mock.restoreAll();
+    await supervisor.dispose();
+    await bridge.stop();
+    await fs.rm(root, { recursive: true });
+  });
+  await until(() => Boolean(disposed));
+  await disposed;
+  assert.equal(await bridge.store.optional(ownerFile), null);
+  assert.equal(bridge.ownsLock, false);
+  assert.equal(globalThis[Symbol.for('dsh-local-bridge.owners')].has(root), false);
+  assert.equal(bridge.timer, undefined);
+  assert.equal(supervisor.bridge, null);
+});
+
+test('bridge prompt routes incoming replies through result and permits an explicit request to send separately', async () => {
+  const { apply } = await import('../index.mjs');
+  let section;
+  let effects = 0;
+  apply({
+    connection: { createPeer: () => ({}) },
+    systemPrompt: { section: value => { section = value; } },
+    effect: () => { effects++; },
+  });
+  assert.equal(effects, 1);
+  assert.equal(section.name, 'local-agent-bridge');
+  assert.match(section.text, /通过桥收到的消息，直接在本轮回复即可/);
+  assert.match(section.text, /发送方会用 result 读取/);
+  assert.match(section.text, /不要再用 to-claude \/ to-codex 重发，除非消息里明确要求/);
+  assert.match(section.text, /result 读的是本轮最后一条回复/);
+  assert.match(section.text, /不要中途先发一条再继续干活/);
+  assert.match(section.text, /三方头脑风暴/);
+});
+
+for (const trigger of ['lostLock', 'aborted']) {
+  test(`r3 supervisor recovers a ${trigger} bridge at the five-second health check and clears monitoring on dispose`, async t => {
+    const { superviseBridge } = await import('../index.mjs');
+    t.mock.timers.enable({ apis: ['setInterval'] });
+    const created = [];
+    const supervisor = superviseBridge(() => {
+      const bridge = { lostLock: false, lifetime: new AbortController(), stops: 0,
+        async start() {}, async stop() { this.stops++; this.lifetime.abort(); } };
+      created.push(bridge);
+      return bridge;
+    });
+    t.after(() => supervisor.dispose());
+    await until(() => supervisor.bridge === created[0]);
+    const first = created[0];
+    if (trigger === 'lostLock') first.lostLock = true;
+    else first.lifetime.abort();
+    t.mock.timers.tick(4999);
+    assert.equal(created.length, 1);
+    t.mock.timers.tick(1);
+    await until(() => created.length === 2 && supervisor.bridge === created[1]);
+    assert.equal(first.stops, 1);
+    await supervisor.dispose();
+    assert.equal(created[1].stops, 1);
+    t.mock.timers.tick(15000);
+    assert.equal(created.length, 2);
+    assert.equal(supervisor.bridge, null);
+  });
+}
+
+test('r3 supervisor backs off a foreign owner during recovery without duplicate launches or heartbeat writes', async t => {
+  const { superviseBridge } = await import('../index.mjs');
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  let creates = 0;
+  const retryTimers = [];
+  const statuses = [];
+  const first = { lostLock: false, async start() {}, async stop() {} };
+  const recovered = { async start() {}, async stop() {} };
+  const supervisor = superviseBridge(() => {
+    creates++;
+    if (creates === 1) return first;
+    if (creates === 2) return {
+      async start() { throw Object.assign(new Error('other owner'), { code: 'bridge_already_running' }); },
+      async stop() {}, async status(...args) { statuses.push(args); },
+    };
+    return recovered;
+  }, { schedule: (fn, ms) => { retryTimers.push({ fn, ms }); return retryTimers.length; }, cancel: () => {} });
+  t.after(() => supervisor.dispose());
+  await until(() => supervisor.bridge === first);
+  first.lostLock = true;
+  t.mock.timers.tick(5000);
+  await until(() => retryTimers.length === 1);
+  assert.equal(retryTimers[0].ms, 2000);
+  assert.deepEqual(statuses, []);
+  t.mock.timers.tick(15000);
+  assert.equal(creates, 2);
+  retryTimers[0].fn();
+  await until(() => supervisor.bridge === recovered);
+  assert.equal(creates, 3);
+});
+
+test('r3 dispose during recovery prevents a delayed stop from launching another bridge', async t => {
+  const { superviseBridge } = await import('../index.mjs');
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  let creates = 0;
+  let releaseStop;
+  const first = { lostLock: false, async start() {}, stop() { return new Promise(resolve => { releaseStop = resolve; }); } };
+  const supervisor = superviseBridge(() => { creates++; return first; });
+  await until(() => supervisor.bridge === first);
+  first.lostLock = true;
+  t.mock.timers.tick(5000);
+  await until(() => Boolean(releaseStop));
+  const disposing = supervisor.dispose();
+  releaseStop();
+  await disposing;
+  t.mock.timers.tick(15000);
+  assert.equal(creates, 1);
+  assert.equal(supervisor.bridge, null);
+});
+
+for (const code of ['EPERM', 'EACCES', 'unsafe_file']) {
+  test(`r3 owner heartbeat ${code} still permits inbox, refresh and prune without declaring lock loss`, async t => {
+    const { bridge, store, root, gateway } = await setup(t);
+    clearInterval(bridge.timer);
+    const originalOptional = store.optional.bind(store);
+    const optional = t.mock.method(store, 'optional', async file => {
+      if (file === path.join(root, 'owner.json')) throw Object.assign(new Error('owner read failed'), { code });
+      return originalOptional(file);
+    });
+    const originalInvoke = gateway.invoke.bind(gateway);
+    let lists = 0;
+    gateway.invoke = call => { if (call.method === 'list') lists++; return originalInvoke(call); };
+    let prunes = 0;
+    t.mock.method(store, 'prune', async () => { prunes++; });
+    try {
+      const job = request();
+      await store.write(store.file('inbox', job.requestId), job);
+      bridge.heartbeatAt = Date.now() - 5001;
+      bridge.nextRefreshAt = 0;
+      bridge.prunedAt = 0;
+      await bridge.tick();
+      assert.equal(await originalOptional(store.file('inbox', job.requestId)), null);
+      await until(() => gateway.prompts.length === 1);
+      assert.equal(lists, 1);
+      assert.equal(prunes, 1);
+      assert.equal(bridge.lastError, code);
+      assert.equal(bridge.lifetime.signal.aborted, false);
+      assert.equal(bridge.lostLock, false);
+    } finally { optional.mock.restore(); }
+  });
+}
+
+test('r4 a failed heartbeat retries at five seconds rather than on every inbox poll', async t => {
+  const { bridge, store, root } = await setup(t);
+  clearInterval(bridge.timer);
+  let now = Date.now();
+  const clock = t.mock.method(Date, 'now', () => now);
+  const originalOptional = store.optional.bind(store);
+  let reads = 0;
+  const optional = t.mock.method(store, 'optional', async file => {
+    if (file === path.join(root, 'owner.json')) {
+      reads++;
+      throw Object.assign(new Error('temporarily inaccessible'), { code: 'EPERM' });
+    }
+    return originalOptional(file);
+  });
+  try {
+    bridge.heartbeatAt = now - 5001;
+    bridge.nextRefreshAt = now + 60000;
+    bridge.prunedAt = now;
+    await bridge.tick();
+    assert.equal(reads, 1);
+    for (let poll = 0; poll < 20; poll++) await bridge.tick();
+    assert.equal(reads, 1);
+    now += 4999;
+    await bridge.tick();
+    assert.equal(reads, 1);
+    now++;
+    await bridge.tick();
+    assert.equal(reads, 2);
+    assert.equal(bridge.lastError, 'EPERM');
+    assert.equal(bridge.lifetime.signal.aborted, false);
+  } finally { optional.mock.restore(); clock.mock.restore(); }
+});
+
+test('r4 a successful refresh removes the previous error and timestamp from the ready heartbeat', async t => {
+  const { bridge, store, root } = await setup(t);
+  clearInterval(bridge.timer);
+  bridge.lastError = 'temporary_failure';
+  bridge.lastErrorAt = Date.now() - 1000;
+  await bridge.status('ready', bridge.lastError);
+  assert.equal((await store.read(path.join(root, 'status.json'))).lastError, 'temporary_failure');
+  await bridge.refresh();
+  const status = await store.read(path.join(root, 'status.json'));
+  assert.equal(status.state, 'ready');
+  assert.equal(status.lastError, undefined);
+  assert.equal(status.lastErrorAt, undefined);
+  assert.equal(status.code, undefined);
+  assert.equal(bridge.lastError, null);
+  assert.equal(bridge.lastErrorAt, null);
+});
+
+test('r4 a failed refresh retains its unresolved error until a successful recovery', async t => {
+  const { bridge, gateway, store, root } = await setup(t);
+  clearInterval(bridge.timer);
+  bridge.lastError = 'still_offline';
+  bridge.lastErrorAt = Date.now() - 1000;
+  const previousAt = bridge.lastErrorAt;
+  await bridge.status('ready', bridge.lastError);
+  gateway.invoke = async () => { throw Object.assign(new Error('offline'), { code: 'session_unavailable' }); };
+  await assert.rejects(bridge.refresh(), { code: 'session_unavailable' });
+  assert.equal(bridge.lastError, 'still_offline');
+  assert.equal(bridge.lastErrorAt, previousAt);
+  assert.equal((await store.read(path.join(root, 'status.json'))).lastError, 'still_offline');
 });
